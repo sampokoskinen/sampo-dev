@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WORLD JAVELIN '88</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; width:100%; background:#000; overflow:hidden;
+    font-family:"Press Start 2P","Courier New",monospace; color:#f4e9c1; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:#000; }
+  canvas { image-rendering:pixelated; image-rendering:crisp-edges; background:#000; display:block; }
+  #hint { position:fixed; bottom:6px; left:0; right:0; text-align:center;
+    font-size:9px; letter-spacing:.12em; opacity:.3; text-transform:uppercase;
+    font-family:"Press Start 2P","Courier New",monospace; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="640" height="360"></canvas></div>
+<div id="hint">F = fullscreen &nbsp; click first for sound</div>
+<script>
+"use strict";
+/* ============================================================
+   WORLD JAVELIN '88  —  a late-80s/early-90s style track sim
+   Single file. Pixel rendering + Web Audio synthesis. No assets.
+   ============================================================ */
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const W = 640, H = 360;
+
+/* ---------- retro font helper ---------- */
+const FONT = '"Press Start 2P","Courier New",monospace';
+const F = (size)=>`${size}px ${FONT}`;
+
+/* ---------- full-screen scaling (keep 16:9, letterbox, crisp pixels) ---------- */
+function fitCanvas(){
+  const s = Math.max(1, Math.min(innerWidth/W, innerHeight/H));
+  canvas.style.width  = Math.floor(W*s)+'px';
+  canvas.style.height = Math.floor(H*s)+'px';
+  ctx.imageSmoothingEnabled = false;
+}
+addEventListener('resize', fitCanvas);
+fitCanvas();
+
+/* ---------- palette (NES-ish) ---------- */
+const COL = {
+  sky1:'#3a6ea5', sky2:'#7fb2d9', sun:'#ffe08a',
+  grass1:'#3fa34d', grass2:'#2f8a3c', track:'#b5532a', trackLine:'#e8c39e',
+  dirt:'#7a4326', white:'#f4e9c1', black:'#15151f', shadow:'rgba(0,0,0,.25)',
+  hud:'#15151f', hudText:'#f4e9c1', red:'#d93b3b', green:'#5ad24f',
+  yellow:'#ffd23f', blue:'#4a7fd6', crowd1:'#c8553d', crowd2:'#4f6d9e', crowd3:'#caa83f',
+};
+
+/* ---------- input ---------- */
+const keys = {};
+const pressed = {}; // edge
+addEventListener('keydown', e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  if(!keys[e.code]) pressed[e.code]=true;
+  keys[e.code]=true;
+});
+addEventListener('keyup', e=>{ keys[e.code]=false; });
+function consume(code){ if(pressed[code]){ pressed[code]=false; return true; } return false; }
+function clearPressed(){ for(const k in pressed) pressed[k]=false; }
+
+/* ============================================================
+   AUDIO  — all synthesized
+   ============================================================ */
+const Sound = (()=>{
+  let ac=null, master=null, crowdGain=null, crowdNoise=null, ready=false;
+  function init(){
+    if(ac) return;
+    ac = new (window.AudioContext||window.webkitAudioContext)();
+    master = ac.createGain(); master.gain.value=0.6; master.connect(ac.destination);
+    // ambient crowd bed: brown noise -> bandpass
+    const buf = ac.createBuffer(1, ac.sampleRate*2, ac.sampleRate);
+    const d = buf.getChannelData(0); let last=0;
+    for(let i=0;i<d.length;i++){ const wn=Math.random()*2-1; last=(last+0.02*wn)/1.02; d[i]=last*3.0; }
+    crowdNoise = ac.createBufferSource(); crowdNoise.buffer=buf; crowdNoise.loop=true;
+    const bp = ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=520; bp.Q.value=0.7;
+    crowdGain = ac.createGain(); crowdGain.gain.value=0.10;
+    crowdNoise.connect(bp); bp.connect(crowdGain); crowdGain.connect(master);
+    crowdNoise.start();
+    ready=true;
+  }
+  function resume(){ if(ac && ac.state==='suspended') ac.resume(); }
+  function now(){ return ac.currentTime; }
+
+  function tone(freq, dur, type='square', vol=0.2, glideTo=null, delay=0){
+    if(!ready) return;
+    const t=now()+delay;
+    const o=ac.createOscillator(); o.type=type; o.frequency.setValueAtTime(freq,t);
+    if(glideTo) o.frequency.exponentialRampToValueAtTime(glideTo, t+dur);
+    const g=ac.createGain();
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(vol,t+0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g); g.connect(master); o.start(t); o.stop(t+dur+0.02);
+  }
+  function noise(dur, vol=0.2, type='highpass', freq=1000, delay=0){
+    if(!ready) return;
+    const t=now()+delay;
+    const len=Math.max(1,Math.floor(ac.sampleRate*dur));
+    const buf=ac.createBuffer(1,len,ac.sampleRate); const d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+    const s=ac.createBufferSource(); s.buffer=buf;
+    const f=ac.createBiquadFilter(); f.type=type; f.frequency.value=freq;
+    const g=ac.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t+dur+0.02);
+  }
+  // SFX
+  const foot = ()=>{ noise(0.07,0.18,'lowpass',380); tone(90,0.06,'square',0.12,60); };
+  const stumble = ()=>{ noise(0.18,0.25,'lowpass',300); tone(140,0.18,'sawtooth',0.18,70); };
+  const beep = (f=660)=> tone(f,0.05,'square',0.18);
+  const select = ()=>{ tone(523,0.05,'square',0.2); tone(784,0.07,'square',0.2,null,0.05); };
+  const grunt = ()=>{ tone(220,0.22,'sawtooth',0.28,90); noise(0.22,0.12,'lowpass',500); };
+  const whoosh = ()=> noise(0.5,0.16,'bandpass',1600);
+  const foul = ()=>{ tone(200,0.5,'sawtooth',0.25,110); tone(150,0.5,'sawtooth',0.2,90,0.0); };
+  const land = ()=>{ noise(0.25,0.3,'lowpass',260); tone(120,0.2,'square',0.15,60); };
+  const bird = ()=>{ for(let i=0;i<5;i++) tone(1400+Math.random()*600,0.06,'square',0.18,2200,i*0.06); };
+  const tick = ()=> tone(1320,0.04,'square',0.12,1760);   // cadence / sweet-zone cue
+  // special FX when the release angle lands in the 33-36° sweet spot
+  function sweet(perfect){
+    const base=[660,990,1320];
+    base.forEach((f,i)=> tone(f,0.12,'triangle',0.2,null,i*0.05));
+    if(perfect){
+      // dead-centre 34-35°: shimmering arpeggio + sparkle
+      [1320,1760,1980,2640].forEach((f,i)=> tone(f,0.16,'square',0.16,null,0.18+i*0.05));
+      for(let i=0;i<4;i++) tone(2600+Math.random()*400,0.08,'sine',0.08,3200,0.3+i*0.06);
+    }
+  }
+  // smooth, reactive crowd-bed level (used during run + flight)
+  function setCrowd(level){ if(!ready||!crowdGain) return; crowdGain.gain.setTargetAtTime(Math.max(0.06,level), now(), 0.2); }
+  // soft ambient murmur swell (idle/title)
+  function murmur(){ if(!ready) return;
+    const t=now();
+    crowdGain.gain.setTargetAtTime(0.18, t, 0.4);
+    crowdGain.gain.setTargetAtTime(0.10, t+0.7, 0.6);
+    for(let i=0;i<5;i++) noise(0.05,0.03,'highpass',2400,Math.random()*0.8);
+  }
+  function cheer(level){ // level 0..1 swell of the crowd
+    if(!ready) return;
+    const t=now();
+    crowdGain.gain.cancelScheduledValues(t);
+    crowdGain.gain.setValueAtTime(crowdGain.gain.value,t);
+    crowdGain.gain.linearRampToValueAtTime(0.05+0.4*level,t+0.15);
+    crowdGain.gain.linearRampToValueAtTime(0.05,t+1.2+level*1.5);
+    // sparkle of applause = bursts of noise
+    const n=Math.floor(6+level*22);
+    for(let i=0;i<n;i++) noise(0.04,0.05+0.05*level,'highpass',2500,Math.random()*(0.8+level));
+    if(level>0.7){ // whistles
+      for(let i=0;i<3;i++) tone(1800+Math.random()*400,0.25,'sine',0.08,2400,0.2+i*0.3);
+    }
+  }
+  function boo(){
+    if(!ready) return;
+    const t=now();
+    crowdGain.gain.cancelScheduledValues(t);
+    crowdGain.gain.setValueAtTime(crowdGain.gain.value,t);
+    crowdGain.gain.linearRampToValueAtTime(0.22,t+0.2);
+    crowdGain.gain.linearRampToValueAtTime(0.05,t+1.6);
+    for(let i=0;i<4;i++) tone(110+i*8,0.6,'sawtooth',0.12,80,i*0.12);
+  }
+  function startMusic(){ if(!ready) return;
+    // tiny anthem arpeggio
+    const seq=[262,330,392,523,392,330];
+    seq.forEach((f,i)=> tone(f,0.18,'triangle',0.12,null,i*0.16));
+  }
+  return { init, resume, foot, stumble, beep, select, grunt, whoosh, foul, land, bird, cheer, boo, startMusic,
+           tick, sweet, setCrowd, murmur, get ready(){return ready;} };
+})();
+
+/* ============================================================
+   THROWERS — humorous stereotypical 80s sports characters
+   ============================================================ */
+const THROWERS = [
+  { name:"BORIS VOLKOV", country:"USSR", flag:["#d93b3b","#ffd23f"], tagline:"State-Sponsored Beefcake",
+    skin:'#e8b98c', hair:'#3a2a1a', singlet:'#d93b3b', trunks:'#a01f1f', accent:'#ffd23f',
+    mustache:true, headband:false, power:1.08, control:0.92 },
+  { name:"CHAD STERLING", country:"USA", flag:["#3050a0","#d93b3b"], tagline:"All-American Mullet",
+    skin:'#f0c89a', hair:'#caa040', singlet:'#3050a0', trunks:'#d93b3b', accent:'#f4e9c1',
+    mustache:false, headband:true, mullet:true, power:1.0, control:1.0 },
+  { name:"GÜNTHER FAUST", country:"BRD", flag:["#15151f","#ffd23f"], tagline:"Tiny Shorts, Big Dreams",
+    skin:'#e8b98c', hair:'#7a5a2a', singlet:'#f4e9c1', trunks:'#15151f', accent:'#d93b3b',
+    mustache:true, headband:false, power:0.96, control:1.1 },
+  { name:"SVEN BJÖRK", country:"SWE", flag:["#3a6ea5","#ffd23f"], tagline:"Flatpack Fury",
+    skin:'#f2d2ad', hair:'#e8d27a', singlet:'#3a6ea5', trunks:'#27508a', accent:'#ffd23f',
+    mustache:false, headband:false, viking:true, power:1.12, control:0.86 },
+  { name:"CARL 'POPS'", country:"AUS", flag:["#2f8a3c","#ffd23f"], tagline:"Beer-Powered Legend",
+    skin:'#e0a87e', hair:'#8a8a8a', singlet:'#2f8a3c', trunks:'#1f5a26', accent:'#ffd23f',
+    mustache:true, belly:true, headband:true, power:1.04, control:0.9 },
+];
+
+/* ============================================================
+   GAME STATE
+   ============================================================ */
+let   SCALE = 12;             // current pixels per metre (camera-controlled)
+const RUN_SCALE = 12;         // zoomed-in during the run
+const FLIGHT_SCALE = 5.0;     // zoomed-out for the throw, so 110m fits on screen
+const RUN_LEFT = 0.14, RUN_CENTRE = 0.50;  // athlete screen pos: start -> foul line
+const RUNWAY_M = 50;          // metres of runway before foul line (line hidden at start)
+const FOUL_X = 0;             // foul line at world x=0; runway is negative x
+const GROUND_Y = 248;         // screen y of the ground/foul line plane
+let G = {};
+
+function newGame(){
+  G = {
+    state:'TITLE',
+    selIndex:0, thrower:null,
+    attempt:0, maxAttempts:3,
+    scores:[],            // {dist, foul}
+    best:0,
+    // run
+    runX:-RUNWAY_M,       // world metres, increases toward 0
+    power:0,              // 0..100 build from rhythm
+    footPhase:0,          // visual leg cycle
+    lastStep:0, stepSide:0, lastInterval:0, rhythmTimer:0, stepFx:0,
+    cadenceMsg:'', cadenceMsgT:0,
+    // aim (set by holding the throw button — longer hold = higher angle)
+    angle:16, charging:false, chargeT:0, sweet:false,
+    // throw
+    jav:null,             // {x,y,vx,vy,angle,stuck,distance}
+    wind:0,               // m/s, +right
+    camX:0, anchorPx:RUN_LEFT*W, murmurT:1.5,
+    resultDist:0, resultFoul:false, resultMsg:'', resultRare:'',
+    timer:0, t:0,
+    bird:null,
+    flash:0,
+  };
+  G.wind = +( (Math.random()*8-4) ).toFixed(1);
+}
+newGame();
+
+/* ---------- helpers ---------- */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+// Camera: anchorPx (in pixels) is where the world point camX maps on screen.
+// During the run the athlete starts at the left and drifts to centre while the
+// world scrolls, so the throwing spot only appears as he approaches it.
+function worldToScreenX(mx){ return G.anchorPx + (mx - G.camX)*SCALE; }
+function updateCamera(){
+  if(G.state==='READY'||G.state==='RUN'){
+    const prog = clamp((G.runX+RUNWAY_M)/RUNWAY_M, 0, 1);
+    SCALE = RUN_SCALE;
+    G.camX = G.runX;                                   // athlete sits on the anchor
+    G.anchorPx = lerp(RUN_LEFT*W, RUN_CENTRE*W, prog); // ...which drifts left -> centre
+  } else if(G.state==='THROW'||G.state==='RESULT'){
+    // ease out to the wide field view (foul line near left, whole runway visible)
+    SCALE = lerp(SCALE, FLIGHT_SCALE, 0.12);
+    G.camX = lerp(G.camX, 0, 0.12);
+    G.anchorPx = lerp(G.anchorPx, RUN_LEFT*W, 0.12);
+  }
+}
+
+/* ============================================================
+   UPDATE
+   ============================================================ */
+let lastT = performance.now();
+function loop(now){
+  const dt = Math.min(0.05,(now-lastT)/1000); lastT=now; G.t+=dt;
+  update(dt, now);
+  render();
+  clearPressed();
+  requestAnimationFrame(loop);
+}
+
+function startThrow(foul){
+  // launch javelin from runner position.
+  // form factor peaks at the 34.5° sweet spot (real javelins fly best ~33-36°,
+  // not the ballistic 45° — aerodynamic lift), and rewards precision heavily.
+  const formFactor = 1 + 0.16*Math.exp(-Math.pow((G.angle-34.5)/7, 2));
+  const launch = (10 + G.power/100*15.0) * G.thrower.power * formFactor; // m/s release speed
+  const a = G.angle*Math.PI/180;
+  const greatAngle = (G.angle>=33 && G.angle<=36);
+  const perfectAngle = (G.angle>=34 && G.angle<=35);
+  G.jav = {
+    x: G.runX, y: 2.0,
+    vx: Math.cos(a)*launch,
+    vy: Math.sin(a)*launch,
+    angle: a, stuck:false, distance:0, peak:0, traced:[], great:greatAngle,
+  };
+  G.resultFoul = foul;
+  G.state='THROW';
+  G.timer=0;
+  G.charging=false;
+  Sound.grunt(); Sound.whoosh();
+  if(!foul && greatAngle) Sound.sweet(perfectAngle);   // special angle FX
+  // rare event seed: chance a bird crosses the flight path
+  G.bird = null;
+  if(Math.random() < 0.16){
+    G.bird = { x: G.runX + 30 + Math.random()*45, y: 14+Math.random()*10, vx:-3-Math.random()*3, alive:true, struck:false, fall:0 };
+  }
+}
+
+function recordResult(){
+  const r = { dist: G.resultFoul?0:G.resultDist, foul:G.resultFoul };
+  G.scores.push(r);
+  if(!G.resultFoul && G.resultDist>G.best) G.best=G.resultDist;
+}
+
+function update(dt, now){
+  G.flash = Math.max(0, G.flash-dt*4);
+
+  // ambient crowd murmur during idle screens
+  if(G.state==='TITLE'||G.state==='READY'||G.state==='SCORE'){
+    G.murmurT -= dt;
+    if(G.murmurT<=0){ Sound.murmur(); G.murmurT = 2.5 + (G.t*7%3); }
+  }
+
+  updateCamera();
+
+  switch(G.state){
+
+  case 'TITLE': {
+    if(consume('ArrowLeft')){ G.selIndex=(G.selIndex+THROWERS.length-1)%THROWERS.length; Sound.select(); }
+    if(consume('ArrowRight')){ G.selIndex=(G.selIndex+1)%THROWERS.length; Sound.select(); }
+    if(consume('Space')||consume('Enter')){
+      G.thrower=THROWERS[G.selIndex];
+      Sound.startMusic();
+      beginAttempt();
+    }
+    break;
+  }
+
+  case 'READY': { // brief intro: shows attempt, wind; press space to begin run
+    G.timer+=dt;
+    if(consume('Space')){ G.state='RUN'; G.timer=0; G.lastStep=now; }
+    break;
+  }
+
+  case 'RUN': updateRun(dt, now); break;
+
+  case 'THROW': updateThrow(dt); break;
+
+  case 'RESULT': {
+    G.timer+=dt;
+    if(consume('Space') && G.timer>0.6){
+      G.attempt++;
+      if(G.attempt>=G.maxAttempts) G.state='SCORE';
+      else beginAttempt();
+    }
+    break;
+  }
+
+  case 'SCORE': {
+    if(consume('Space')){
+      const sel=G.selIndex;
+      newGame(); G.selIndex=sel; G.state='TITLE';
+    }
+    break;
+  }
+  }
+}
+
+function beginAttempt(){
+  G.runX=-RUNWAY_M; G.power=0; G.footPhase=0; G.stepSide=0; G.lastInterval=0;
+  G.rhythmTimer=0; G.jav=null; G.camX=-RUNWAY_M; G.angle=16;
+  SCALE=RUN_SCALE; G.anchorPx=RUN_LEFT*W;
+  G.charging=false; G.chargeT=0; G.sweet=false;
+  G.cadenceMsg=''; G.cadenceMsgT=0; G.bird=null;
+  G.wind = +((Math.random()*8-4)).toFixed(1);
+  G.state='READY'; G.timer=0;
+}
+
+/* ---------- RUN: speed + rhythm mechanic ----------
+   Alternate LEFT / RIGHT like footsteps. The FASTER you alternate, the more
+   speed you gain (speed is the main driver); a steady rhythm adds a bonus on
+   top. Hitting the same foot twice trips you up. SPACE starts the throw.      */
+const ANGLE_MIN=16, ANGLE_MAX=54, CHARGE_RATE=20; // deg, deg, deg/sec
+function updateRun(dt, now){
+
+  // ----- CHARGING THE THROW (hold SPACE; longer hold = higher angle) -----
+  if(G.charging){
+    G.chargeT += dt;
+    G.angle = Math.min(ANGLE_MAX, ANGLE_MIN + G.chargeT*CHARGE_RATE);
+    const nowSweet = (G.angle>=33 && G.angle<=36);
+    if(nowSweet && !G.sweet) Sound.tick();       // entered the sweet zone — audible cue
+    G.sweet = nowSweet;
+    // planted and STOPPED — speed is locked in, he does not move
+    crowdRun();
+    if(!keys['Space']){ startThrow(false); return; }  // release => throw
+    return;
+  }
+
+  // ----- RHYTHM RUN -----
+  // begin the throw wind-up (plants on the spot, speed locked)
+  if(consume('Space')){ G.charging=true; G.chargeT=0; G.angle=ANGLE_MIN; G.sweet=false; return; }
+
+  // footstep input — must alternate sides
+  let stepCode=null, side=null;
+  if(consume('KeyA')||consume('ArrowLeft')){ stepCode='L'; side=-1; }
+  else if(consume('KeyD')||consume('ArrowRight')){ stepCode='R'; side=1; }
+  if(stepCode){
+    const tnow=now/1000;
+    const interval = G.lastStepT? (tnow-G.lastStepT) : 0.25;
+    G.lastStepT=tnow;
+    if(side===G.stepSide){
+      // same foot twice — clumsy, lose momentum (forces real alternation)
+      G.power=clamp(G.power-7,0,100); Sound.stumble();
+      G.cadenceMsg="WRONG FOOT!"; G.cadenceMsgT=0.7; G.stepFx=0.3;
+    } else {
+      G.stepSide=side;
+      // SPEED is primary: the shorter the interval, the bigger the gain.
+      // interval .06s -> ~19, .15s -> ~13, .30s -> ~6, .45s -> ~1
+      let gain = clamp((0.48 - interval)*44, 1, 19);
+      // RHYTHM is a secondary bonus: reward a steady cadence
+      if(G.lastInterval && Math.abs(interval-G.lastInterval) < 0.045){
+        gain += 5; G.cadenceMsg="PERFECT!"; Sound.tick();
+      } else if(interval < 0.16){
+        G.cadenceMsg="FAST!";
+      } else {
+        G.cadenceMsg="GOOD";
+      }
+      G.cadenceMsgT=0.5;
+      gain *= G.thrower.control;
+      G.power=clamp(G.power+gain,0,100);
+      G.stepFx=0.25; Sound.foot();
+      G.lastInterval=interval;
+    }
+  }
+
+  // gentle decay so momentum is held but not free (keep pumping!)
+  G.power=clamp(G.power - 4*dt, 0, 100);
+  if(G.stepFx>0) G.stepFx-=dt*1.5;
+  if(G.cadenceMsgT>0) G.cadenceMsgT-=dt;
+
+  // advance runner — faster top speed so a hot rhythm really flies
+  const spd = (2 + G.power/100*13) * G.thrower.power;  // m/s
+  G.runX += spd*dt;
+  G.footPhase += spd*dt*2.2;
+
+  // crowd builds with the run
+  crowdRun();
+
+  // ran past the foul line still in the run => foul
+  if(G.runX>=FOUL_X){ G.runX=0; startThrow(true); }
+}
+function crowdRun(){ Sound.setCrowd(0.09 + G.power/100*0.22); }
+
+/* ---------- THROW: projectile + wind + rare events ---------- */
+function updateThrow(dt){
+  const j=G.jav;
+  if(!j.stuck){
+    // physics (sub-step for stability)
+    const steps=3, h=dt/steps;
+    for(let s=0;s<steps;s++){
+      j.vy -= 9.81*h;                         // gravity
+      j.vx += (G.wind*0.4)*h;                 // wind push
+      j.vx -= j.vx*0.02*h;                    // slight drag
+      j.x += j.vx*h; j.y += j.vy*h;
+      j.angle = Math.atan2(j.vy, j.vx);
+      if(j.y<0){ j.y=0; j.stuck=true; break; }
+    }
+    if(j.y>j.peak) j.peak=j.y;
+    if(j.traced.length<240 && (G.t*60|0)%1===0) j.traced.push({x:j.x,y:j.y});
+
+    // bird
+    if(G.bird && G.bird.alive){
+      G.bird.x += G.bird.vx*dt;
+      if(!G.bird.struck && Math.abs(j.x-G.bird.x)<0.7 && Math.abs(j.y-G.bird.y)<0.9){
+        G.bird.struck=true; G.bird.alive=false; G.bird.fall=0;
+        Sound.bird();
+        j.vx*=0.55; j.vy=Math.min(j.vy,-1); // javelin knocked down
+        G.resultRare="!! BIRD STRIKE !! SEAGULL DOWN - CROWD GASPS";
+        G.flash=1;
+      }
+    }
+
+    if(j.stuck){
+      j.distance = j.x - FOUL_X;
+      finishThrow();
+    }
+  }
+  // bird falling animation
+  if(G.bird && G.bird.struck){ G.bird.fall+=dt; G.bird.y-=18*dt*0; G.bird.fy=(G.bird.fy||G.bird.y); G.bird.fy=Math.max(0,G.bird.fy-(G.bird.fall*8)); }
+
+  // crowd "ooohs" while it hangs in the air — louder the higher/longer it flies
+  if(!j.stuck) Sound.setCrowd(0.16 + clamp(j.y/40,0,0.34));
+}
+
+function finishThrow(){
+  const j=G.jav;
+  G.resultDist = Math.max(0, +j.distance.toFixed(2));
+  Sound.land();
+  G.timer=0; G.state='RESULT';
+
+  if(G.resultFoul){
+    G.resultMsg="FOUL! Crossed the line.";
+    Sound.boo();
+  } else {
+    const d=G.resultDist;
+    if(d>85){ G.resultMsg="WORLD CLASS!!!"; Sound.cheer(1.0); }
+    else if(d>70){ G.resultMsg="HUGE THROW!"; Sound.cheer(0.85); }
+    else if(d>55){ G.resultMsg="SOLID."; Sound.cheer(0.6); }
+    else if(d>35){ G.resultMsg="Not bad."; Sound.cheer(0.35); }
+    else { G.resultMsg="Weak effort..."; Sound.cheer(0.15); }
+  }
+  recordResult();
+  // the rare-event banner stays visible through RESULT; beginAttempt() clears it.
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function render(){
+  // sky
+  const g=ctx.createLinearGradient(0,0,0,GROUND_Y);
+  g.addColorStop(0,COL.sky1); g.addColorStop(1,COL.sky2);
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,GROUND_Y);
+  // sun
+  ctx.fillStyle=COL.sun; ctx.beginPath(); ctx.arc(460,58,24,0,7); ctx.fill();
+
+  if(G.state==='TITLE'){ renderTitle(); return; }
+  if(G.state==='SCORE'){ renderScore(); return; }
+
+  drawStadium();
+  drawField();
+
+  if(G.state==='THROW'||G.state==='RESULT') drawJavelinFlight();
+  drawThrower();
+  if(G.bird) drawBird();
+
+  drawHUD();
+  drawWindVane();
+  if(G.charging) drawAngleMeter();
+
+  if(G.state==='READY') drawReadyOverlay();
+  if(G.state==='RESULT') drawResultOverlay();
+
+  // flash on rare event
+  if(G.flash>0){ ctx.fillStyle=`rgba(255,255,255,${G.flash*0.5})`; ctx.fillRect(0,0,W,H); }
+}
+
+/* ---------- stadium / crowd ---------- */
+function drawStadium(){
+  // stand band
+  ctx.fillStyle='#2b2b3e'; ctx.fillRect(0,70,W,80);
+  // crowd dots (deterministic-ish by position)
+  const cols=[COL.crowd1,COL.crowd2,COL.crowd3,'#cfcfcf','#7a4326'];
+  for(let row=0;row<7;row++){
+    const yy=78+row*9;
+    for(let i=0;i<W;i+=7){
+      const seed=(i*13+row*97);
+      const c=cols[(seed)%cols.length];
+      ctx.fillStyle=c;
+      // bob with crowd excitement
+      let bob=0;
+      const exc = (G.state==='RESULT'&&!G.resultFoul)?2:0;
+      if(exc) bob = Math.sin(G.t*12 + seed)*1.5*exc>0?-2:0;
+      ctx.fillRect(i+(row%2?3:0), yy+bob, 4, 5);
+    }
+  }
+  // stand rail
+  ctx.fillStyle='#15151f'; ctx.fillRect(0,150,W,4);
+  // jumbotron
+  ctx.fillStyle='#0c0c14'; ctx.fillRect(40,30,90,34);
+  ctx.fillStyle=COL.green; ctx.font=F(6); ctx.textAlign='left';
+  ctx.fillText('WORLD',48,44); ctx.fillText('JAV 88',48,56);
+}
+
+/* ---------- field, track, distance markers ---------- */
+function drawField(){
+  // grass
+  ctx.fillStyle=COL.grass1; ctx.fillRect(0,GROUND_Y,W,H-GROUND_Y);
+  ctx.fillStyle=COL.grass2;
+  for(let y=GROUND_Y;y<H;y+=8) if(((y/8)|0)%2) ctx.fillRect(0,y,W,4);
+
+  // runway (red track) on left of foul line
+  const foulSX=worldToScreenX(FOUL_X);
+  ctx.fillStyle=COL.track;
+  ctx.fillRect(0, GROUND_Y-2, foulSX, 10);
+  // foul line
+  ctx.fillStyle=COL.white; ctx.fillRect(foulSX-2, GROUND_Y-6, 4, 16);
+
+  // distance markers every 10 m on the field
+  ctx.font=F(6); ctx.textAlign='center';
+  for(let m=0;m<=120;m+=10){
+    const sx=worldToScreenX(m);
+    if(sx<-20||sx>W+20) continue;
+    ctx.fillStyle=COL.trackLine; ctx.fillRect(sx-1,GROUND_Y-1,2,8);
+    ctx.fillStyle='#1d3d22'; ctx.fillText(m+'M', sx, GROUND_Y+22);
+  }
+  // sector lines
+  ctx.strokeStyle='rgba(255,255,255,.25)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(foulSX,GROUND_Y); ctx.lineTo(W, GROUND_Y-18); ctx.stroke();
+}
+
+const PI=Math.PI;
+// fixed HUD wind vane: a pole + pennant that points where the wind blows,
+// length & colour scale with strength. (+ = tailwind, downrange; - = headwind)
+function drawWindVane(){
+  if(!(G.state==='READY'||G.state==='RUN'||G.state==='THROW')) return;
+  const px=W-104, py=30, pw=96, ph=40;
+  ctx.fillStyle='rgba(8,8,16,.72)'; ctx.fillRect(px,py,pw,ph);
+  ctx.strokeStyle=COL.black; ctx.lineWidth=1; ctx.strokeRect(px,py,pw,ph);
+  ctx.fillStyle=COL.white; ctx.font=F(6); ctx.textAlign='left';
+  ctx.fillText('WIND',px+5,py+11);
+  const dir=Math.sign(G.wind)||1, str=Math.abs(G.wind);
+  ctx.textAlign='right'; ctx.fillStyle = str>2.5?COL.red:(str>0.2?COL.yellow:COL.white);
+  ctx.fillText(str.toFixed(1)+' M/S', px+pw-5, py+11);
+  // pole + fluttering pennant
+  const poleX=px+18, baseY=py+ph-6, topY=py+18;
+  ctx.strokeStyle=COL.white; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(poleX,baseY); ctx.lineTo(poleX,topY); ctx.stroke();
+  const len = 8 + str*8, wob=Math.sin(G.t*9)*2;
+  if(str<0.2){
+    ctx.fillStyle='#888'; ctx.fillRect(poleX-1,topY,3,4); // limp = calm
+  } else {
+    ctx.fillStyle = str>2.5?COL.red:COL.yellow;
+    ctx.beginPath();
+    ctx.moveTo(poleX, topY);
+    ctx.lineTo(poleX+dir*len, topY+3+wob);
+    ctx.lineTo(poleX+dir*len, topY+8+wob);
+    ctx.lineTo(poleX, topY+11);
+    ctx.fill();
+  }
+  ctx.fillStyle=COL.white; ctx.font=F(6); ctx.textAlign='center';
+  ctx.fillText(str<0.2?'CALM':(dir>0?'TAIL':'HEAD'), poleX+dir*len+ (dir>0?0:0), baseY+0);
+}
+
+// protractor angle meter, shown while the throw angle is being set
+// (centred near the top so it's easy to glance at while watching the athlete)
+function drawAngleMeter(){
+  const pw=146, ph=90, px=Math.round(W/2-pw/2), py=30;
+  ctx.fillStyle='rgba(8,8,16,.78)'; ctx.fillRect(px,py,pw,ph);
+  ctx.strokeStyle=COL.black; ctx.strokeRect(px,py,pw,ph);
+  const cx=px+30, cy=py+ph-22, R=70;
+  // sweet-zone wedge 33-36
+  ctx.fillStyle='rgba(90,210,79,.35)';
+  ctx.beginPath(); ctx.moveTo(cx,cy);
+  ctx.arc(cx,cy,R,-36*PI/180,-33*PI/180,false); ctx.closePath(); ctx.fill();
+  // baseline + arc ticks
+  ctx.strokeStyle='#5a5a6e'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+R,cy); ctx.stroke();
+  for(let d=0; d<=60; d+=15){
+    const a=d*PI/180;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(a)*(R-6), cy-Math.sin(a)*(R-6));
+    ctx.lineTo(cx+Math.cos(a)*R, cy-Math.sin(a)*R); ctx.stroke();
+  }
+  // needle
+  const a=G.angle*PI/180, col=G.sweet?COL.green:COL.yellow;
+  ctx.strokeStyle=col; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(a)*R, cy-Math.sin(a)*R); ctx.stroke();
+  ctx.fillStyle=col; ctx.beginPath(); ctx.arc(cx,cy,3,0,7); ctx.fill();
+  // labels
+  ctx.fillStyle=COL.white; ctx.font=F(6); ctx.textAlign='left'; ctx.fillText('ANGLE',px+8,py+12);
+  ctx.fillStyle=col; ctx.font=F(16); ctx.textAlign='right';
+  ctx.fillText(Math.round(G.angle)+'', px+pw-10, py+24);
+  ctx.font=F(6); ctx.fillStyle=COL.white; ctx.fillText('DEG', px+pw-10, py+34);
+  if(G.sweet){ ctx.fillStyle=COL.green; ctx.font=F(7); ctx.textAlign='center';
+    ctx.fillText('SWEET SPOT', px+pw/2, py+ph-6); }
+}
+
+/* ---------- thrower pixel sprite ---------- */
+function drawThrower(){
+  if(G.state==='THROW' || G.state==='RESULT'){
+    // standing at release point, follow-through pose
+    const sx=worldToScreenX(Math.min(G.runX,FOUL_X));
+    drawAthlete(sx, GROUND_Y+6, G.thrower, 'throw', 0);
+    return;
+  }
+  const sx=worldToScreenX(G.runX);
+  // planted throw pose while charging; running otherwise
+  drawAthlete(sx, GROUND_Y+6, G.thrower, G.charging?'throw':'run', G.footPhase);
+
+  // aim arrow + sweet-zone guide while charging the throw
+  if(G.charging){
+    const ox=sx, oy=GROUND_Y-34, R=40;
+    // sweet-zone wedge (33-36°)
+    ctx.strokeStyle='rgba(90,210,79,.45)'; ctx.lineWidth=1;
+    [33,36].forEach(d=>{ const a=d*Math.PI/180;
+      ctx.beginPath(); ctx.moveTo(ox,oy); ctx.lineTo(ox+Math.cos(a)*R, oy-Math.sin(a)*R); ctx.stroke(); });
+    // active aim
+    const a=G.angle*Math.PI/180;
+    ctx.strokeStyle=G.sweet?COL.green:COL.yellow; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(ox,oy); ctx.lineTo(ox+Math.cos(a)*R, oy-Math.sin(a)*R); ctx.stroke();
+    const ex=ox+Math.cos(a)*R, ey=oy-Math.sin(a)*R;
+    ctx.fillStyle=G.sweet?COL.green:COL.yellow; ctx.beginPath(); ctx.arc(ex,ey,3,0,7); ctx.fill();
+    if(G.sweet){ ctx.fillStyle=COL.green; ctx.font=F(7); ctx.textAlign='center';
+      ctx.fillText('GREAT ANGLE!', ox, oy-46); }
+  }
+}
+
+function px(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(x|0,y|0,w,h); }
+function drawAthlete(cx, footY, t, mode, phase){
+  const x=Math.round(cx), y=Math.round(footY);
+  // shadow
+  ctx.fillStyle=COL.shadow; ctx.beginPath(); ctx.ellipse(x,y,14,4,0,0,7); ctx.fill();
+  const sk=t.skin, sng=t.singlet, trk=t.trunks, hair=t.hair, acc=t.accent;
+
+  const swing = Math.sin(phase)*5;
+  const swing2= Math.sin(phase+Math.PI)*5;
+  const bodyTop=y-40, bodyBob=mode==='run'?Math.abs(Math.sin(phase))*-2:0;
+
+  if(mode==='run'){
+    // back leg
+    px(x-3, y-14+0, 4, 14+swing*0+ (swing>0?swing:0), trk);
+    // front leg
+    px(x+1, y-14, 4, 14 + (swing2>0?swing2:0), trk);
+    // legs skin (calves)
+    px(x-3, y-4+(swing>0?swing:0), 4, 4, sk);
+    px(x+1, y-4+(swing2>0?swing2:0), 4, 4, sk);
+  } else {
+    // throw stance: wide legs
+    px(x-7, y-14, 4, 14, trk); px(x+4, y-16, 4, 16, trk);
+    px(x-7, y-4, 4, 4, sk); px(x+4, y-4, 4, 4, sk);
+  }
+
+  // torso (singlet)
+  px(x-4, bodyTop+bodyBob, 9, 22, sng);
+  if(t.belly){ px(x+3,bodyTop+10+bodyBob,4,12,sng); }
+  // accent stripe
+  px(x-4, bodyTop+8+bodyBob, 9, 3, acc);
+
+  // arms
+  if(mode==='run'){
+    px(x-7, bodyTop+4+bodyBob, 4, 10, sk);  // back arm
+    px(x+5, bodyTop+2+bodyBob, 4, 10, sk);  // front arm
+    // javelin carried
+    ctx.strokeStyle='#cfc089'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(x+10, bodyTop+2+bodyBob); ctx.lineTo(x+34, bodyTop-2+bodyBob); ctx.stroke();
+    ctx.fillStyle=COL.black; ctx.beginPath(); ctx.arc(x+34,bodyTop-2+bodyBob,2,0,7); ctx.fill();
+  } else {
+    // throw: front arm extended up/back
+    px(x+3, bodyTop-4+bodyBob, 4, 10, sk);
+    px(x-8, bodyTop+6, 5, 4, sk);
+  }
+
+  // head
+  const hx=x-3, hy=bodyTop-12+bodyBob;
+  px(hx, hy, 8, 9, sk);
+  // hair
+  px(hx-1, hy-2, 10, 4, hair);
+  if(t.mullet){ px(hx-2, hy+4, 3, 8, hair); }     // mullet flow
+  if(t.viking){ px(hx-2,hy-2,2,3,acc); px(hx+8,hy-2,2,3,acc); } // horns
+  if(t.headband){ px(hx-1, hy+1, 10, 2, COL.red); }
+  // face
+  px(hx+5, hy+3, 2, 2, COL.black); // eye
+  if(t.mustache){ px(hx+3, hy+6, 5, 2, hair); }
+}
+
+/* ---------- javelin in flight ---------- */
+function drawJavelinFlight(){
+  const j=G.jav;
+  // trajectory trace
+  ctx.strokeStyle='rgba(255,255,255,.3)'; ctx.lineWidth=1; ctx.beginPath();
+  let first=true;
+  for(const p of j.traced){ const sx=worldToScreenX(p.x), sy=GROUND_Y-6-p.y*SCALE;
+    if(first){ctx.moveTo(sx,sy);first=false;} else ctx.lineTo(sx,sy); }
+  ctx.stroke();
+  // javelin
+  const sx=worldToScreenX(j.x), sy=GROUND_Y-6-j.y*SCALE;
+  const len=22;
+  const dx=Math.cos(j.angle)*len, dy=-Math.sin(j.angle)*len;
+  ctx.strokeStyle='#e9dca0'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(sx-dx*0.3, sy-dy*0.3); ctx.lineTo(sx+dx*0.7, sy+dy*0.7); ctx.stroke();
+  // tip
+  ctx.fillStyle=COL.black; ctx.beginPath(); ctx.arc(sx+dx*0.7, sy+dy*0.7, 2,0,7); ctx.fill();
+  // grip
+  ctx.fillStyle=COL.red; ctx.fillRect(sx-2,sy-2,4,4);
+}
+
+function drawBird(){
+  const b=G.bird;
+  const sx=worldToScreenX(b.x);
+  let sy;
+  if(b.struck){ sy=GROUND_Y-6-(b.fy!=null?b.fy:b.y)*SCALE; }
+  else sy=GROUND_Y-6-b.y*SCALE;
+  ctx.fillStyle='#f4e9c1';
+  if(b.struck){
+    // tumbling X_X
+    ctx.fillRect(sx-3,sy-2,6,4);
+    ctx.fillStyle=COL.black; ctx.fillRect(sx-2,sy-1,1,1); ctx.fillRect(sx+1,sy-1,1,1);
+  } else {
+    const flap=Math.sin(G.t*16)*3;
+    ctx.fillStyle='#e8e8e8';
+    ctx.beginPath(); ctx.moveTo(sx-5,sy+flap); ctx.lineTo(sx,sy); ctx.lineTo(sx+5,sy+flap); ctx.lineTo(sx,sy+2); ctx.fill();
+  }
+}
+
+/* ---------- HUD ---------- */
+function drawHUD(){
+  // top bar
+  ctx.fillStyle=COL.hud; ctx.fillRect(0,0,W,24);
+  ctx.fillStyle=COL.hudText; ctx.font=F(7); ctx.textAlign='left';
+  ctx.fillText(`${G.thrower.name} ${G.thrower.country}`, 8, 15);
+  ctx.textAlign='center';
+  ctx.fillText(`TRY ${G.attempt+1}/${G.maxAttempts}`, W/2, 15);
+  ctx.textAlign='right';
+  ctx.fillText(`BEST ${G.best.toFixed(2)}`, W-8, 15);
+
+  // power / cadence meter (run)
+  if(G.state==='RUN'||G.state==='READY'){
+    const bx=20, by=H-28, bw=W-40, bh=12;
+    ctx.fillStyle='#0c0c14'; ctx.fillRect(bx-2,by-2,bw+4,bh+4);
+    const fillC = G.power>80?COL.red:G.power>50?COL.yellow:COL.green;
+    ctx.fillStyle=fillC; ctx.fillRect(bx,by,bw*G.power/100,bh);
+    ctx.fillStyle=COL.white; ctx.font=F(6); ctx.textAlign='left';
+    ctx.fillText(G.charging?'SPEED LOCKED':'SPEED',bx,by-5);
+    if(G.charging && Math.sin(G.t*14)>0){
+      ctx.fillStyle=COL.white; ctx.textAlign='right';
+      ctx.fillText('RELEASE TO THROW', bx+bw, by-5);
+    }
+    // cadence feedback (floats over the athlete)
+    if(G.cadenceMsgT>0){
+      ctx.textAlign='center'; ctx.font=F(9);
+      ctx.fillStyle = G.cadenceMsg==='PERFECT!'?COL.green : (G.cadenceMsg.includes('!')&&G.cadenceMsg!=='GOOD')?COL.red:COL.yellow;
+      ctx.fillText(G.cadenceMsg, clamp(worldToScreenX(G.runX),60,W-60), GROUND_Y-62);
+    }
+  }
+  // rare event banner
+  if(G.resultRare && (G.state==='THROW'||G.state==='RESULT')){
+    ctx.fillStyle='rgba(0,0,0,.7)'; ctx.fillRect(0,104,W,22);
+    ctx.fillStyle=COL.yellow; ctx.font=F(8); ctx.textAlign='center';
+    ctx.fillText(G.resultRare, W/2, 119);
+  }
+}
+
+/* ---------- overlays ---------- */
+function drawReadyOverlay(){
+  ctx.fillStyle='rgba(0,0,0,.62)'; ctx.fillRect(0,96,W,150);
+  ctx.textAlign='center'; ctx.fillStyle=COL.white;
+  ctx.font=F(14); ctx.fillText('GET READY', W/2,124);
+  ctx.font=F(7); ctx.fillStyle=COL.white;
+  ctx.fillText('ALTERNATE LEFT / RIGHT AS FAST AS', W/2,150);
+  ctx.fillText('YOU CAN - KEEP A RHYTHM FOR BONUS', W/2,164);
+  ctx.fillText('HOLD SPACE TO RAISE ANGLE,', W/2,182);
+  ctx.fillText('RELEASE TO THROW - AIM 33-36', W/2,196);
+  ctx.fillStyle=COL.yellow;
+  ctx.fillText(`WIND ${Math.abs(G.wind).toFixed(1)} M/S ${G.wind>0.2?'TAIL':G.wind<-0.2?'HEAD':'CALM'}`, W/2, 216);
+  if(Math.sin(G.t*6)>0){ ctx.fillStyle=COL.green; ctx.fillText('>> PRESS SPACE TO START <<', W/2, 234); }
+}
+
+function drawResultOverlay(){
+  ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(0,134,W,96);
+  ctx.textAlign='center';
+  if(G.resultFoul){
+    ctx.fillStyle=COL.red; ctx.font=F(18); ctx.fillText('FOUL!', W/2,172);
+    ctx.fillStyle=COL.white; ctx.font=F(7);
+    ctx.fillText('STEPPED OVER THE LINE - NO MARK', W/2,196);
+  } else {
+    ctx.fillStyle=COL.white; ctx.font=F(20);
+    ctx.fillText(`${G.resultDist.toFixed(2)}M`, W/2,176);
+    ctx.fillStyle=COL.yellow; ctx.font=F(9);
+    ctx.fillText(G.resultMsg, W/2,198);
+  }
+  if(Math.sin(G.t*6)>0){ ctx.fillStyle=COL.green; ctx.font=F(7);
+    ctx.fillText('PRESS SPACE TO CONTINUE', W/2, 220); }
+}
+
+/* ---------- title screen ---------- */
+function renderTitle(){
+  // backdrop
+  drawStadium();
+  ctx.fillStyle=COL.grass1; ctx.fillRect(0,GROUND_Y,W,H-GROUND_Y);
+  // title
+  ctx.textAlign='center';
+  ctx.fillStyle=COL.black; ctx.font=F(22);
+  ctx.fillText('WORLD JAVELIN', W/2+2, 42+2);
+  ctx.fillStyle=COL.yellow; ctx.fillText('WORLD JAVELIN', W/2, 42);
+  ctx.fillStyle=COL.red; ctx.font=F(13); ctx.fillText("'88", W/2, 62);
+
+  // selected thrower showcase
+  const t=THROWERS[G.selIndex];
+  drawAthlete(W/2, 232, t, 'run', G.t*6);
+  ctx.fillStyle=COL.white; ctx.font=F(11);
+  ctx.fillText(`${t.name}`, W/2, 256);
+  ctx.fillStyle=t.singlet; ctx.font=F(6);
+  ctx.fillText(`${t.country} - ${t.tagline.toUpperCase()}`, W/2, 270);
+  // stat bars
+  ctx.font=F(6); ctx.textAlign='center';
+  drawStat(W/2-74, 286, 'POWER', t.power, 0.86, 1.12);
+  drawStat(W/2+14, 286, 'CONTROL', t.control, 0.86, 1.12);
+
+  // selector arrows
+  ctx.fillStyle=COL.white; ctx.font=F(16);
+  ctx.fillText('<', 70, 238); ctx.fillText('>', W-70, 238);
+
+  ctx.fillStyle=COL.yellow; ctx.font=F(7);
+  if(Math.sin(G.t*6)>0) ctx.fillText('< > CHOOSE   SPACE = COMPETE', W/2, 326);
+  if(!Sound.ready){ ctx.fillStyle='#999'; ctx.font=F(6); ctx.fillText('CLICK TO ENABLE SOUND', W/2, 346); }
+}
+function drawStat(x,y,label,v,min,max){
+  ctx.fillStyle=COL.white; ctx.textAlign='left'; ctx.font=F(6); ctx.fillText(label, x, y);
+  ctx.fillStyle='#333'; ctx.fillRect(x,y+4,64,5);
+  ctx.fillStyle=COL.green; ctx.fillRect(x,y+4,64*(v-min)/(max-min),5);
+}
+
+/* ---------- scoreboard ---------- */
+function renderScore(){
+  drawStadium();
+  ctx.fillStyle=COL.grass1; ctx.fillRect(0,GROUND_Y,W,H-GROUND_Y);
+  ctx.fillStyle='rgba(8,8,16,.92)'; ctx.fillRect(70,40,W-140,280);
+  ctx.strokeStyle=COL.yellow; ctx.lineWidth=2; ctx.strokeRect(70,40,W-140,280);
+  ctx.textAlign='center'; ctx.fillStyle=COL.yellow; ctx.font=F(13);
+  ctx.fillText('* SCOREBOARD *', W/2, 68);
+  ctx.fillStyle=COL.white; ctx.font=F(8);
+  ctx.fillText(`${G.thrower.name} ${G.thrower.country}`, W/2, 90);
+
+  ctx.font=F(10); ctx.textAlign='left';
+  G.scores.forEach((s,i)=>{
+    const y=124+i*26;
+    ctx.fillStyle=COL.white;
+    ctx.fillText(`THROW ${i+1}`, 128, y);
+    if(s.foul){ ctx.fillStyle=COL.red; ctx.textAlign='right'; ctx.fillText('FOUL', W-128, y); ctx.textAlign='left'; }
+    else { ctx.fillStyle = (s.dist===G.best)?COL.green:COL.white; ctx.textAlign='right'; ctx.fillText(`${s.dist.toFixed(2)}M`, W-128, y); ctx.textAlign='left'; }
+  });
+
+  ctx.textAlign='center'; ctx.font=F(13);
+  ctx.fillStyle=COL.green; ctx.fillText(`BEST ${G.best.toFixed(2)}M`, W/2, 228);
+
+  // grade
+  let grade='TRY AGAIN', gc=COL.red;
+  if(G.best>95){grade='WORLD RECORD PACE!';gc=COL.yellow;}
+  else if(G.best>78){grade='GOLD MEDAL!';gc=COL.yellow;}
+  else if(G.best>60){grade='PODIUM FINISH';gc=COL.green;}
+  else if(G.best>42){grade='RESPECTABLE';gc=COL.white;}
+  ctx.fillStyle=gc; ctx.font=F(10); ctx.fillText(grade, W/2, 256);
+
+  ctx.fillStyle=COL.white; ctx.font=F(7);
+  if(Math.sin(G.t*6)>0) ctx.fillText('PRESS SPACE FOR NEW GAME', W/2, 296);
+}
+
+/* ---------- clear rare message between attempts ---------- */
+const _origBegin = beginAttempt;
+beginAttempt = function(){ G.resultRare=''; _origBegin(); };
+
+/* ---------- audio unlock + fullscreen ---------- */
+canvas.addEventListener('mousedown', ()=>{ Sound.init(); Sound.resume(); canvas.focus(); });
+addEventListener('keydown', (e)=>{
+  if(!Sound.ready) Sound.init(); Sound.resume();
+  if(e.code==='KeyF'){
+    const el=document.getElementById('wrap');
+    if(!document.fullscreenElement) el.requestFullscreen && el.requestFullscreen();
+    else document.exitFullscreen && document.exitFullscreen();
+  }
+});
+document.addEventListener('fullscreenchange', fitCanvas);
+canvas.tabIndex=0;
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
